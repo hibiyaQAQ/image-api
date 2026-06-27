@@ -181,3 +181,5 @@ curl http://localhost:3000/v1/images/generations \
 | `MAX_IMAGES` | `16` | 单次编辑最多参考图数量 |
 | `BODY_LIMIT` | `30mb` | JSON 请求体大小上限 |
 | `REQUEST_TIMEOUT_SECONDS` | `300` | 调用上游超时时间 |
+| `DEBUG_SAVE_OUTPUT_IMAGES` | `false` | 调试开关；开启后把上游返回的最终图片额外保存到本地目录 |
+| `DEBUG_OUTPUT_DIR` | `output` | 调试输出图片保存目录 |

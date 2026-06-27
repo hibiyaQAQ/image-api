@@ -9,11 +9,12 @@ import { createAdminRouter } from "./admin-routes.js";
 import { createAdminStore } from "./admin-store.js";
 import { config } from "./config.js";
 import { estimateImageCost } from "./cost.js";
+import { createDebugSseOutputCollector, saveDebugOutputImages } from "./debug-output.js";
 import { createCustomerRouter } from "./customer-routes.js";
 import { HttpError, UpstreamHttpError, openAiErrorBody } from "./errors.js";
 import { createStorage } from "./storage.js";
 import { normalizeImageEditRequest, normalizeImageGenerationRequest, transformImageResponse } from "./translator.js";
-import { postJsonToUpstream } from "./upstream.js";
+import { postJsonToUpstream, postStreamToUpstream } from "./upstream.js";
 
 function asyncHandler(handler) {
   return (request, response, next) => {
@@ -216,7 +217,11 @@ async function assertBudgetAllowed(adminStore, customerKey, preflightCost) {
 async function recordImageRequest({ adminStore, request, endpoint, normalized, upstreamResponse, error, startedAt }) {
   const latencyMs = Date.now() - startedAt;
   const responseBody = upstreamResponse || null;
-  const cost = responseBody ? estimateImageCost({ requestBody: normalized?.upstreamBody, responseBody }) : null;
+  const cost = responseBody
+    ? estimateImageCost({ requestBody: normalized?.upstreamBody, responseBody })
+    : !error && normalized?.upstreamBody
+      ? estimateImageCost({ requestBody: normalized.upstreamBody })
+      : null;
   const statusCode = error instanceof UpstreamHttpError ? error.status : error instanceof HttpError ? error.status : error ? 500 : 200;
   const customerKey = request.customerKey || null;
 
@@ -241,6 +246,293 @@ async function recordImageRequest({ adminStore, request, endpoint, normalized, u
     promptPreview: promptPreview(normalized?.upstreamBody?.prompt),
     ip: getRequestIp(request)
   });
+}
+
+function isStreamingRequest(normalized) {
+  return normalized?.upstreamBody?.stream === true;
+}
+
+function isClientClosedStream(error) {
+  return error?.status === 499 || error?.code === "ERR_STREAM_PREMATURE_CLOSE" || error?.code === "ERR_STREAM_DESTROYED" || error?.code === "ECONNRESET";
+}
+
+function createClientClosedStreamError() {
+  return new HttpError(499, "客户端在流式响应完成前断开连接", { type: "client_closed_request" });
+}
+
+function logDebugOutputError(error) {
+  console.error("保存调试输出图片失败", error);
+}
+
+async function saveDebugOutputsSafely(responseBody, { gatewayConfig, outputFormat, label }) {
+  await saveDebugOutputImages(responseBody, { gatewayConfig, outputFormat, label }).catch(logDebugOutputError);
+}
+
+function parseSseEvent(eventText) {
+  const lines = eventText.split(/\r?\n/);
+  let eventName = "";
+  const dataLines = [];
+
+  for (const line of lines) {
+    if (line.startsWith("event:")) {
+      eventName = line.slice("event:".length).trim();
+      continue;
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  const data = dataLines.join("\n").trim();
+  if (!data || data === "[DONE]") {
+    return { eventName, payload: null };
+  }
+
+  try {
+    return { eventName, payload: JSON.parse(data) };
+  } catch {
+    return { eventName, payload: null };
+  }
+}
+
+function createStreamEventInspector() {
+  let buffer = "";
+  let streamError = null;
+
+  function inspect(eventText) {
+    const event = parseSseEvent(eventText);
+    const payload = event.payload;
+    if (!payload) return;
+
+    if (event.eventName === "error" || payload.type === "error" || payload.error) {
+      streamError = payload.error || payload;
+    }
+  }
+
+  return {
+    accept(text) {
+      if (!text) return;
+      buffer += text;
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || "";
+      for (const eventText of events) {
+        inspect(eventText);
+      }
+    },
+    flush() {
+      if (buffer.trim()) {
+        inspect(buffer);
+      }
+      buffer = "";
+    },
+    getError() {
+      return streamError;
+    }
+  };
+}
+
+function createStreamEventError(errorPayload) {
+  const payload = errorPayload && typeof errorPayload === "object" ? errorPayload : {};
+  const body = {
+    error: {
+      message: payload.message || "上游流式响应返回错误事件",
+      type: payload.type || "upstream_stream_error",
+      param: payload.param ?? null,
+      code: payload.code ?? null
+    }
+  };
+  const status = body.error.type === "image_generation_user_error" || body.error.code === "moderation_blocked" ? 400 : 502;
+  return new UpstreamHttpError(status, body, {
+    rawBody: JSON.stringify(body),
+    contentType: "application/json; charset=utf-8",
+    passthrough: true
+  });
+}
+
+function firstCompleteSseEvent(text) {
+  const match = /\r?\n\r?\n/.exec(text);
+  if (!match) return null;
+  return text.slice(0, match.index);
+}
+
+async function waitForDrain(response) {
+  await new Promise((resolve, reject) => {
+    const cleanup = () => {
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      response.off("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(createClientClosedStreamError());
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+    response.once("error", onError);
+  });
+}
+
+async function writeResponseChunk(response, chunk) {
+  if (response.destroyed || response.writableEnded) {
+    throw createClientClosedStreamError();
+  }
+
+  if (!response.write(chunk)) {
+    await waitForDrain(response);
+  }
+}
+
+async function peekStreamingError(upstreamBody) {
+  const reader = upstreamBody.getReader();
+  const decoder = new TextDecoder("utf-8");
+  const bufferedChunks = [];
+  let bufferedText = "";
+  let bufferedBytes = 0;
+  const maxPeekBytes = 64 * 1024;
+
+  while (bufferedBytes < maxPeekBytes) {
+    const { done, value } = await reader.read();
+    if (done) {
+      bufferedText += decoder.decode();
+      return {
+        reader,
+        bufferedChunks,
+        bufferedText,
+        streamError: null,
+        done: true
+      };
+    }
+
+    bufferedChunks.push(Buffer.from(value));
+    bufferedBytes += value.byteLength;
+    bufferedText += decoder.decode(value, { stream: true });
+
+    const firstEvent = firstCompleteSseEvent(bufferedText);
+    if (firstEvent !== null) {
+      const event = parseSseEvent(firstEvent);
+      const payload = event.payload;
+      const streamError =
+        payload && (event.eventName === "error" || payload.type === "error" || payload.error)
+          ? payload.error || payload
+          : null;
+
+      return {
+        reader,
+        bufferedChunks,
+        bufferedText,
+        streamError,
+        done: false
+      };
+    }
+  }
+
+  return {
+    reader,
+    bufferedChunks,
+    bufferedText,
+    streamError: null,
+    done: false
+  };
+}
+
+async function writeRemainingEventStream(reader, response, debugCollector, eventInspector) {
+  const decoder = new TextDecoder("utf-8");
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const text = decoder.decode(value, { stream: true });
+      await writeResponseChunk(response, Buffer.from(value));
+      eventInspector.accept(text);
+      await debugCollector?.accept(text).catch(logDebugOutputError);
+    }
+
+    const tail = decoder.decode();
+    if (tail) {
+      eventInspector.accept(tail);
+      await debugCollector?.accept(tail).catch(logDebugOutputError);
+    }
+    eventInspector.flush();
+    await debugCollector?.flush().catch(logDebugOutputError);
+    response.end();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function sendStreamingUpstreamResponse({ upstreamPath, normalized, gatewayConfig, response }) {
+  const upstreamStream = await postStreamToUpstream(upstreamPath, normalized.upstreamBody, gatewayConfig);
+  const upstreamResponse = upstreamStream.response;
+  const debugCollector = createDebugSseOutputCollector({
+    gatewayConfig,
+    outputFormat: normalized.outputFormat,
+    label: upstreamPath.replace("/", "-")
+  });
+  const eventInspector = createStreamEventInspector();
+
+  if (!upstreamResponse.body) {
+    response.status(upstreamResponse.status);
+    response.set("content-type", "text/event-stream; charset=utf-8");
+    response.set("cache-control", "no-cache");
+    response.set("connection", "keep-alive");
+    response.set("x-accel-buffering", "no");
+    response.end();
+    upstreamStream.cleanup();
+    return {
+      streamError: null
+    };
+  }
+
+  const peeked = await peekStreamingError(upstreamResponse.body);
+  if (peeked.streamError) {
+    peeked.reader.releaseLock();
+    upstreamStream.cleanup();
+    return {
+      earlyError: createStreamEventError(peeked.streamError),
+      streamError: peeked.streamError
+    };
+  }
+
+  response.status(upstreamResponse.status);
+  response.set("content-type", "text/event-stream; charset=utf-8");
+  response.set("cache-control", "no-cache");
+  response.set("connection", "keep-alive");
+  response.set("x-accel-buffering", "no");
+  response.flushHeaders?.();
+
+  try {
+    for (const chunk of peeked.bufferedChunks) {
+      await writeResponseChunk(response, chunk);
+    }
+    eventInspector.accept(peeked.bufferedText);
+    await debugCollector?.accept(peeked.bufferedText).catch(logDebugOutputError);
+
+    if (peeked.done) {
+      eventInspector.flush();
+      await debugCollector?.flush().catch(logDebugOutputError);
+      response.end();
+    } else {
+      await writeRemainingEventStream(peeked.reader, response, debugCollector, eventInspector);
+    }
+
+    return {
+      streamError: eventInspector.getError()
+    };
+  } finally {
+    upstreamStream.cleanup();
+  }
 }
 
 export function createApp({ gatewayConfig = config, storage = createStorage(gatewayConfig), adminStore = createAdminStore(gatewayConfig) } = {}) {
@@ -284,7 +576,22 @@ export function createApp({ gatewayConfig = config, storage = createStorage(gate
         });
         await assertBudgetAllowed(adminStore, request.customerKey, estimateImageCost({ requestBody: normalized.upstreamBody }));
 
+        if (isStreamingRequest(normalized)) {
+          const streamResult = await sendStreamingUpstreamResponse({ upstreamPath: "images/edits", normalized, gatewayConfig, response });
+          if (streamResult?.earlyError) {
+            throw streamResult.earlyError;
+          }
+          const streamError = streamResult?.streamError ? createStreamEventError(streamResult.streamError) : null;
+          await recordImageRequest({ adminStore, request, endpoint: "/v1/images/edits", normalized, upstreamResponse: null, error: streamError, startedAt });
+          return;
+        }
+
         upstreamResponse = await postJsonToUpstream("images/edits", normalized.upstreamBody, gatewayConfig);
+        await saveDebugOutputsSafely(upstreamResponse, {
+          gatewayConfig,
+          outputFormat: normalized.outputFormat,
+          label: "images-edits"
+        });
         const responseBody = await transformImageResponse(upstreamResponse, {
           responseFormat: normalized.responseFormat,
           outputFormat: normalized.outputFormat,
@@ -295,9 +602,20 @@ export function createApp({ gatewayConfig = config, storage = createStorage(gate
         await recordImageRequest({ adminStore, request, endpoint: "/v1/images/edits", normalized, upstreamResponse, startedAt });
         response.json(responseBody);
       } catch (error) {
+        if (response.headersSent && isClientClosedStream(error)) {
+          const logErrorBody = error.status === 499 ? error : createClientClosedStreamError();
+          await recordImageRequest({ adminStore, request, endpoint: "/v1/images/edits", normalized, upstreamResponse: null, error: logErrorBody, startedAt }).catch((logError) => {
+            console.error("记录请求日志失败", logError);
+          });
+          return;
+        }
         await recordImageRequest({ adminStore, request, endpoint: "/v1/images/edits", normalized, upstreamResponse, error, startedAt }).catch((logError) => {
           console.error("记录请求日志失败", logError);
         });
+        if (response.headersSent) {
+          console.error("流式响应传输失败", error);
+          return;
+        }
         throw error;
       }
     })
@@ -319,7 +637,22 @@ export function createApp({ gatewayConfig = config, storage = createStorage(gate
         });
         await assertBudgetAllowed(adminStore, request.customerKey, estimateImageCost({ requestBody: normalized.upstreamBody }));
 
+        if (isStreamingRequest(normalized)) {
+          const streamResult = await sendStreamingUpstreamResponse({ upstreamPath: "images/generations", normalized, gatewayConfig, response });
+          if (streamResult?.earlyError) {
+            throw streamResult.earlyError;
+          }
+          const streamError = streamResult?.streamError ? createStreamEventError(streamResult.streamError) : null;
+          await recordImageRequest({ adminStore, request, endpoint: "/v1/images/generations", normalized, upstreamResponse: null, error: streamError, startedAt });
+          return;
+        }
+
         upstreamResponse = await postJsonToUpstream("images/generations", normalized.upstreamBody, gatewayConfig);
+        await saveDebugOutputsSafely(upstreamResponse, {
+          gatewayConfig,
+          outputFormat: normalized.outputFormat,
+          label: "images-generations"
+        });
         const responseBody = await transformImageResponse(upstreamResponse, {
           responseFormat: normalized.responseFormat,
           outputFormat: normalized.outputFormat,
@@ -330,9 +663,20 @@ export function createApp({ gatewayConfig = config, storage = createStorage(gate
         await recordImageRequest({ adminStore, request, endpoint: "/v1/images/generations", normalized, upstreamResponse, startedAt });
         response.json(responseBody);
       } catch (error) {
+        if (response.headersSent && isClientClosedStream(error)) {
+          const logErrorBody = error.status === 499 ? error : createClientClosedStreamError();
+          await recordImageRequest({ adminStore, request, endpoint: "/v1/images/generations", normalized, upstreamResponse: null, error: logErrorBody, startedAt }).catch((logError) => {
+            console.error("记录请求日志失败", logError);
+          });
+          return;
+        }
         await recordImageRequest({ adminStore, request, endpoint: "/v1/images/generations", normalized, upstreamResponse, error, startedAt }).catch((logError) => {
           console.error("记录请求日志失败", logError);
         });
+        if (response.headersSent) {
+          console.error("流式响应传输失败", error);
+          return;
+        }
         throw error;
       }
     })

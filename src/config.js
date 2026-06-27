@@ -23,6 +23,17 @@ function parseIntegerEnv(name, fallback) {
   return value;
 }
 
+function parseBooleanEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+
+  throw new Error(`${name} 必须是布尔值：true/false`);
+}
+
 function parseBytesEnv(name, fallback) {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -87,7 +98,9 @@ export function loadConfig() {
     maxStoredFiles: parseIntegerEnv("MAX_STORED_FILES", 5000),
     maxImages: parseIntegerEnv("MAX_IMAGES", 16),
     bodyLimit: process.env.BODY_LIMIT || "30mb",
-    requestTimeoutMs: parseIntegerEnv("REQUEST_TIMEOUT_SECONDS", 300) * 1000
+    requestTimeoutMs: parseIntegerEnv("REQUEST_TIMEOUT_SECONDS", 300) * 1000,
+    debugSaveOutputImages: parseBooleanEnv("DEBUG_SAVE_OUTPUT_IMAGES", false),
+    debugOutputDir: path.resolve(projectRoot, process.env.DEBUG_OUTPUT_DIR || "output")
   };
 }
 
