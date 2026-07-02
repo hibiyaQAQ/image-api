@@ -690,6 +690,52 @@ export function createApp({ gatewayConfig = config, storage = createStorage(gate
     );
   });
 
+  app.post(
+    "/v1/messages",
+    asyncHandler(async (request, response) => {
+      const body = request.body;
+      const extraHeaders = {};
+      const anthropicVersion = request.get("anthropic-version");
+      if (anthropicVersion) extraHeaders["anthropic-version"] = anthropicVersion;
+      const anthropicBeta = request.get("anthropic-beta");
+      if (anthropicBeta) extraHeaders["anthropic-beta"] = anthropicBeta;
+
+      if (body?.stream === true) {
+        const upstreamStream = await postStreamToUpstream("messages", body, gatewayConfig, { extraHeaders });
+        const upstreamRes = upstreamStream.response;
+
+        response.status(upstreamRes.status);
+        response.set("content-type", upstreamRes.headers.get("content-type") || "text/event-stream; charset=utf-8");
+        response.set("cache-control", "no-cache");
+        response.set("connection", "keep-alive");
+        response.set("x-accel-buffering", "no");
+        response.flushHeaders?.();
+
+        try {
+          if (upstreamRes.body) {
+            const reader = upstreamRes.body.getReader();
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (response.destroyed || response.writableEnded) break;
+                response.write(Buffer.from(value));
+              }
+            } finally {
+              reader.releaseLock();
+            }
+          }
+          response.end();
+        } finally {
+          upstreamStream.cleanup();
+        }
+      } else {
+        const upstreamResponse = await postJsonToUpstream("messages", body, gatewayConfig, { extraHeaders });
+        response.json(upstreamResponse);
+      }
+    })
+  );
+
   app.use((request, response) => {
     sendOpenAiJson(response, 404, openAiErrorBody(new HttpError(404, "接口不存在", { type: "invalid_request_error" })));
   });
