@@ -46,7 +46,27 @@ function normalizeRewrittenUrl(request) {
 }
 
 export default async function handler(request, response) {
-  normalizeRewrittenUrl(request);
-  const app = await getApp();
-  return app(request, response);
+  try {
+    normalizeRewrittenUrl(request);
+    const app = await getApp();
+    return app(request, response);
+  } catch (error) {
+    console.error("Vercel 函数处理失败", error);
+
+    if (response.headersSent) {
+      response.end();
+      return;
+    }
+
+    response.statusCode = 500;
+    response.setHeader("content-type", "application/json; charset=utf-8");
+    response.end(
+      JSON.stringify({
+        error: {
+          message: error?.message || "Vercel 函数处理失败",
+          type: "server_error"
+        }
+      })
+    );
+  }
 }
