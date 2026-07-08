@@ -745,6 +745,8 @@ export function createApp({ gatewayConfig = config, storage = createStorage(gate
   return app;
 }
 
+export default createApp();
+
 export async function startServer(gatewayConfig = config) {
   const storage = createStorage(gatewayConfig);
   const adminStore = createAdminStore(gatewayConfig);

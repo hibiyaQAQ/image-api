@@ -32,3 +32,20 @@ https://你的域名/health
 - 数据库与函数区域距离过远时，首次自动建表可能较慢。
 
 现在 `api/index.js` 会捕获函数初始化错误并返回 JSON，Vercel Runtime Logs 里也会打印 `Vercel 函数处理失败`，方便定位真正的异常。
+
+## Invalid export found in module "/var/task/src/server.js"
+
+Vercel 可能会根据 `package.json` 的 `main` 字段探测 `src/server.js`。如果该文件没有默认导出，运行时会报：
+
+```text
+Invalid export found in module "/var/task/src/server.js".
+The default export must be a function or server.
+```
+
+项目已在 `src/server.js` 中增加默认导出：
+
+```js
+export default createApp();
+```
+
+这样即使 Vercel 直接加载 `src/server.js`，也能拿到一个 Express app；本地 `npm start` 仍然会走 `startServer()` 并监听端口。
