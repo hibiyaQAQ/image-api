@@ -33,6 +33,22 @@ https://你的域名/health
 
 现在 `api/index.js` 会捕获函数初始化错误并返回 JSON，Vercel Runtime Logs 里也会打印 `Vercel 函数处理失败`，方便定位真正的异常。
 
+## Cloudflare 504
+
+如果页面显示 Cloudflare 的 `504: Gateway time-out`，说明请求至少有一段链路经过了 Cloudflare。即使控制台里没有开启小黄云，也可能是：
+
+- 当前访问的不是 Vercel 原始域名，而是经过了 Cloudflare 的自定义域名。
+- DNS 缓存仍然指向 Cloudflare。
+- CNAME 的目标服务本身使用了 Cloudflare。
+- 域名有通配符记录或上级记录仍在 Cloudflare 代理下。
+
+排查顺序：
+
+1. 先直接访问 Vercel 原始域名的 `/health`，例如 `https://项目名.vercel.app/health`。
+2. 如果原始域名正常，自定义域名 504，就是 DNS/Cloudflare/域名绑定问题。
+3. 如果原始域名也 504，再看 Vercel Runtime Logs。
+4. 确认 `package.json` 没有 `main` 字段指向 `src/server.js`，避免 Vercel 自动探测错误入口；当前项目只通过 `api/index.js` 和 `vercel.json` 暴露函数。
+
 ## Invalid export found in module "/var/task/src/server.js"
 
 Vercel 可能会根据 `package.json` 的 `main` 字段探测 `src/server.js`。如果该文件没有默认导出，运行时会报：

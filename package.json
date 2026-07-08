@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "OpenAI Images 兼容聚合网关，把 base64 或文件上传转换为上游可访问的图片 URL。",
   "type": "module",
-  "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
