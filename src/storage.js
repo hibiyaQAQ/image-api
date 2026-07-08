@@ -97,7 +97,7 @@ export function parseRawBase64Image(value) {
   return { buffer, mimeType: detectMime(buffer, "image/png") };
 }
 
-export function createStorage(storageConfig) {
+function createLocalStorage(storageConfig) {
   const storageDir = storageConfig.storageDir;
   const fileRoutePrefix = storageConfig.fileRoutePrefix;
   const maxUploadBytes = storageConfig.maxUploadBytes;
@@ -248,4 +248,91 @@ export function createStorage(storageConfig) {
     cleanupExpired,
     startCleanupTimer
   };
+}
+
+function normalizeBlobPrefix(value) {
+  return String(value || "")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+}
+
+function buildBlobPath(storageConfig, fileName) {
+  const prefix = normalizeBlobPrefix(storageConfig.blobPrefix);
+  return prefix ? `${prefix}/${fileName}` : fileName;
+}
+
+async function loadBlobPut() {
+  try {
+    const { put } = await import("@vercel/blob");
+    return put;
+  } catch (error) {
+    if (error.code === "ERR_MODULE_NOT_FOUND") {
+      throw new HttpError(500, "缺少 @vercel/blob 依赖，无法使用 Vercel Blob 存储");
+    }
+    throw error;
+  }
+}
+
+function createVercelBlobStorage(storageConfig) {
+  const maxUploadBytes = storageConfig.maxUploadBytes;
+
+  async function ensureReady() {
+    return null;
+  }
+
+  async function cleanupExpired() {
+    return null;
+  }
+
+  async function saveBuffer({ buffer, mimeType, kind = "input" }) {
+    if (!Buffer.isBuffer(buffer)) {
+      throw new HttpError(400, "图片内容必须是二进制 Buffer");
+    }
+
+    if (buffer.length > maxUploadBytes) {
+      throw new HttpError(400, `单张图片不能超过 ${maxUploadBytes} 字节`);
+    }
+
+    const detectedMimeType = detectMime(buffer, mimeType);
+    if (!detectedMimeType.startsWith("image/")) {
+      throw new HttpError(400, "仅支持图片文件");
+    }
+
+    const put = await loadBlobPut();
+    const fileName = `${kind}-${Date.now()}-${randomUUID()}.${extensionForMime(detectedMimeType)}`;
+    const blobPath = buildBlobPath(storageConfig, fileName);
+    const blob = await put(blobPath, buffer, {
+      access: "public",
+      addRandomSuffix: false,
+      cacheControlMaxAge: storageConfig.blobCacheControlMaxAgeSeconds,
+      contentType: detectedMimeType
+    });
+
+    return {
+      url: blob.url,
+      fileName,
+      filePath: blob.pathname || blobPath,
+      mimeType: detectedMimeType,
+      size: buffer.length
+    };
+  }
+
+  function startCleanupTimer() {
+    return null;
+  }
+
+  return {
+    ensureReady,
+    saveBuffer,
+    cleanupExpired,
+    startCleanupTimer
+  };
+}
+
+export function createStorage(storageConfig) {
+  if (storageConfig.storageProvider === "vercel-blob") {
+    return createVercelBlobStorage(storageConfig);
+  }
+
+  return createLocalStorage(storageConfig);
 }

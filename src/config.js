@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const isVercel = Boolean(process.env.VERCEL);
 
 function trimTrailingSlash(value) {
   return value.replace(/\/+$/, "");
@@ -67,11 +68,33 @@ function parseJsonObjectEnv(name, fallback) {
   return parsed;
 }
 
+function resolveRuntimePath(value) {
+  return path.isAbsolute(value) ? value : path.resolve(projectRoot, value);
+}
+
+function parseStorageProvider() {
+  const raw = (process.env.STORAGE_PROVIDER || "auto").trim().toLowerCase();
+
+  if (raw === "auto") {
+    return process.env.BLOB_READ_WRITE_TOKEN ? "vercel-blob" : "local";
+  }
+
+  if (raw === "local" || raw === "vercel-blob") {
+    return raw;
+  }
+
+  throw new Error("STORAGE_PROVIDER 必须是 auto、local 或 vercel-blob");
+}
+
 export function loadConfig() {
   const netlifyUrl = process.env.NETLIFY_URL ? trimTrailingSlash(process.env.NETLIFY_URL) : "";
   const upstreamBaseUrl = trimTrailingSlash(
     process.env.UPSTREAM_BASE_URL || (netlifyUrl ? `${netlifyUrl}/.netlify/ai/v1` : "https://stellar-quokka-2fdb2f.netlify.app/.netlify/ai/v1")
   );
+  const defaultAdminStoreFile = isVercel ? "/tmp/image-api/admin-store.json" : "data/admin-store.json";
+  const defaultStorageDir = isVercel ? "/tmp/image-api/uploads" : "data/uploads";
+  const defaultDebugOutputDir = isVercel ? "/tmp/image-api/output" : "output";
+  const defaultRequestTimeoutSeconds = isVercel ? 55 : 300;
 
   return {
     port: parseIntegerEnv("PORT", 3000),
@@ -84,13 +107,16 @@ export function loadConfig() {
     adminUsername: process.env.ADMIN_USERNAME || "admin",
     adminPassword: process.env.ADMIN_PASSWORD || "",
     adminToken: process.env.ADMIN_TOKEN || "",
-    adminStoreFile: path.resolve(projectRoot, process.env.ADMIN_STORE_FILE || "data/admin-store.json"),
+    adminStoreFile: resolveRuntimePath(process.env.ADMIN_STORE_FILE || defaultAdminStoreFile),
     maxLogEntries: parseIntegerEnv("MAX_LOG_ENTRIES", 5000),
     publicBaseUrl: process.env.PUBLIC_BASE_URL ? trimTrailingSlash(process.env.PUBLIC_BASE_URL) : "",
     defaultImageModel: process.env.DEFAULT_IMAGE_MODEL || "gpt-image-2",
     modelAliases: parseJsonObjectEnv("MODEL_ALIASES", {}),
-    storageDir: path.resolve(projectRoot, process.env.STORAGE_DIR || "data/uploads"),
+    storageProvider: parseStorageProvider(),
+    storageDir: resolveRuntimePath(process.env.STORAGE_DIR || defaultStorageDir),
     fileRoutePrefix: ensureRoutePrefix(process.env.FILE_ROUTE_PREFIX || "/uploads"),
+    blobPrefix: (process.env.BLOB_PREFIX || "image-api").replace(/^\/+|\/+$/g, ""),
+    blobCacheControlMaxAgeSeconds: parseIntegerEnv("BLOB_CACHE_CONTROL_MAX_AGE_SECONDS", 60 * 60),
     tempFileTtlMs: parseIntegerEnv("TEMP_FILE_TTL_SECONDS", 24 * 60 * 60) * 1000,
     cleanupIntervalMs: parseIntegerEnv("CLEANUP_INTERVAL_SECONDS", 60 * 60) * 1000,
     maxUploadBytes: parseBytesEnv("MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
@@ -98,9 +124,9 @@ export function loadConfig() {
     maxStoredFiles: parseIntegerEnv("MAX_STORED_FILES", 5000),
     maxImages: parseIntegerEnv("MAX_IMAGES", 16),
     bodyLimit: process.env.BODY_LIMIT || "30mb",
-    requestTimeoutMs: parseIntegerEnv("REQUEST_TIMEOUT_SECONDS", 300) * 1000,
+    requestTimeoutMs: parseIntegerEnv("REQUEST_TIMEOUT_SECONDS", defaultRequestTimeoutSeconds) * 1000,
     debugSaveOutputImages: parseBooleanEnv("DEBUG_SAVE_OUTPUT_IMAGES", false),
-    debugOutputDir: path.resolve(projectRoot, process.env.DEBUG_OUTPUT_DIR || "output")
+    debugOutputDir: resolveRuntimePath(process.env.DEBUG_OUTPUT_DIR || defaultDebugOutputDir)
   };
 }
 
