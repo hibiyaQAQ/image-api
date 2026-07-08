@@ -16,6 +16,7 @@ PUBLIC_BASE_URL=https://你的-vercel-域名.vercel.app
 GATEWAY_API_KEY=给客户端使用的网关密钥
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=管理台密码
+ADMIN_STORE_PROVIDER=auto
 STORAGE_PROVIDER=auto
 ```
 
@@ -42,9 +43,29 @@ BLOB_CACHE_CONTROL_MAX_AGE_SECONDS=3600
 
 ## 管理台持久化限制
 
-管理台当前仍使用 JSON 文件存储。Vercel 上默认写入 `/tmp/image-api/admin-store.json`，因此客户 key 和请求日志不会跨实例或重新部署持久保存。
+管理台支持两种存储：
 
-生产环境建议优先使用 `GATEWAY_API_KEY` 作为固定网关密钥；如果要长期使用管理台分发 key，需要再接入外部数据库或 KV。
+- `ADMIN_STORE_PROVIDER=postgres`：使用 Vercel Marketplace 数据库持久化客户 key、预算和请求日志。
+- `ADMIN_STORE_PROVIDER=local`：使用本地 JSON 文件，Vercel 上会写入 `/tmp/image-api/admin-store.json`，不适合生产持久化。
+- `ADMIN_STORE_PROVIDER=auto`：检测到 `DATABASE_URL` 或 `POSTGRES_URL` 时自动使用 Postgres，否则退回本地 JSON 文件。
+
+推荐在 Vercel 项目里通过 Marketplace 绑定 Neon Postgres 或其他 Postgres 数据库。Vercel 会自动注入连接串，项目会在首次请求时自动创建下面两张表：
+
+- `image_api_keys`
+- `image_api_request_logs`
+
+常用数据库环境变量：
+
+```env
+ADMIN_STORE_PROVIDER=auto
+DATABASE_URL=postgres://...
+POSTGRES_URL=postgres://...
+DATABASE_MAX_CONNECTIONS=1
+DATABASE_CONNECT_TIMEOUT_SECONDS=10
+DATABASE_IDLE_TIMEOUT_SECONDS=20
+```
+
+在 Vercel Serverless 环境中建议保持 `DATABASE_MAX_CONNECTIONS=1`，避免函数实例过多时耗尽数据库连接。绑定数据库后，管理台创建的客户 key、预算和日志会跨实例、跨重新部署保留。
 
 ## 部署命令
 

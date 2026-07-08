@@ -86,11 +86,26 @@ function parseStorageProvider() {
   throw new Error("STORAGE_PROVIDER 必须是 auto、local 或 vercel-blob");
 }
 
+function parseAdminStoreProvider(databaseUrl) {
+  const raw = (process.env.ADMIN_STORE_PROVIDER || "auto").trim().toLowerCase();
+
+  if (raw === "auto") {
+    return databaseUrl ? "postgres" : "local";
+  }
+
+  if (raw === "local" || raw === "postgres") {
+    return raw;
+  }
+
+  throw new Error("ADMIN_STORE_PROVIDER 必须是 auto、local 或 postgres");
+}
+
 export function loadConfig() {
   const netlifyUrl = process.env.NETLIFY_URL ? trimTrailingSlash(process.env.NETLIFY_URL) : "";
   const upstreamBaseUrl = trimTrailingSlash(
     process.env.UPSTREAM_BASE_URL || (netlifyUrl ? `${netlifyUrl}/.netlify/ai/v1` : "https://stellar-quokka-2fdb2f.netlify.app/.netlify/ai/v1")
   );
+  const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
   const defaultAdminStoreFile = isVercel ? "/tmp/image-api/admin-store.json" : "data/admin-store.json";
   const defaultStorageDir = isVercel ? "/tmp/image-api/uploads" : "data/uploads";
   const defaultDebugOutputDir = isVercel ? "/tmp/image-api/output" : "output";
@@ -107,7 +122,12 @@ export function loadConfig() {
     adminUsername: process.env.ADMIN_USERNAME || "admin",
     adminPassword: process.env.ADMIN_PASSWORD || "",
     adminToken: process.env.ADMIN_TOKEN || "",
+    adminStoreProvider: parseAdminStoreProvider(databaseUrl),
     adminStoreFile: resolveRuntimePath(process.env.ADMIN_STORE_FILE || defaultAdminStoreFile),
+    databaseUrl,
+    databaseMaxConnections: parseIntegerEnv("DATABASE_MAX_CONNECTIONS", 1),
+    databaseConnectTimeoutSeconds: parseIntegerEnv("DATABASE_CONNECT_TIMEOUT_SECONDS", 10),
+    databaseIdleTimeoutSeconds: parseIntegerEnv("DATABASE_IDLE_TIMEOUT_SECONDS", 20),
     maxLogEntries: parseIntegerEnv("MAX_LOG_ENTRIES", 5000),
     publicBaseUrl: process.env.PUBLIC_BASE_URL ? trimTrailingSlash(process.env.PUBLIC_BASE_URL) : "",
     defaultImageModel: process.env.DEFAULT_IMAGE_MODEL || "gpt-image-2",
